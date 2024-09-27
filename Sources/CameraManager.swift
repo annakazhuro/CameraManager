@@ -91,7 +91,7 @@ extension CaptureContent {
         let options = PHImageRequestOptions()
         options.version = .original
         options.isSynchronous = true
-        manager.requestImageData(for: asset, options: options) { data, _, _, _ in
+        manager.requestImageDataAndOrientation(for: asset, options: options) { data, _, _, _ in
             
             imageData = data
         }
@@ -105,6 +105,10 @@ public enum CaptureError: Error {
     case noVideoConnection
     case noSampleBuffer
     case assetNotSaved
+}
+
+public protocol ImageCompletionDelegate {
+    func imageFinishedProcessing(with result: CaptureResult)
 }
 
 /// Class for handling iDevices custom camera usage
@@ -136,7 +140,7 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
         var alertController = UIAlertController(title: erTitle, message: erMessage, preferredStyle: .alert)
         alertController.addAction(UIAlertAction(title: "OK", style: UIAlertAction.Style.default, handler: { (_) -> Void in }))
         
-        if let topController = UIApplication.shared.keyWindow?.rootViewController {
+        if let topController = UIWindow.key?.rootViewController {
             topController.present(alertController, animated: true, completion: nil)
         }
     }
@@ -366,10 +370,11 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
         AVCaptureDevice.default(for: AVMediaType.audio)
     }()
     
-    fileprivate var stillImageOutput: AVCaptureStillImageOutput?
+    fileprivate var photoOutput: AVCapturePhotoOutput?
     fileprivate var movieOutput: AVCaptureMovieFileOutput?
     open private(set) var previewLayer: AVCaptureVideoPreviewLayer?
     fileprivate var library: PHPhotoLibrary?
+    fileprivate var captureResultCompletion: ((CaptureResult) -> Void)?
     
     fileprivate var cameraIsSetup = false
     fileprivate var cameraIsObservingDeviceOrientation = false
@@ -509,8 +514,9 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
         frontCameraDevice = nil
         backCameraDevice = nil
         mic = nil
-        stillImageOutput = nil
+        photoOutput = nil
         movieOutput = nil
+        captureResultCompletion = nil
         animateCameraDeviceChange = oldAnimationValue
     }
     
@@ -531,6 +537,25 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
         }
         
         capturePictureWithCompletion(completion)
+    }
+    
+    /**
+     Captures still image from currently running capture session.
+     
+     :param: imageCompletion Completion block containing the captured imageData
+     */
+    @available(*, deprecated)
+    open func capturePictureDataWithCompletion(_ imageCompletion: @escaping (Data?, NSError?) -> Void) {
+        func completion(_ result: CaptureResult) {
+            switch result {
+            case let .success(content):
+                imageCompletion(content.asData, nil)
+            case .failure:
+                imageCompletion(nil, NSError())
+            }
+        }
+        
+        capturePictureDataWithCompletion(completion)
     }
     
     /**
@@ -672,24 +697,6 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
      
      :param: imageCompletion Completion block containing the captured imageData
      */
-    @available(*, deprecated)
-    open func capturePictureDataWithCompletion(_ imageCompletion: @escaping (Data?, NSError?) -> Void) {
-        func completion(_ result: CaptureResult) {
-            switch result {
-            case let .success(content):
-                imageCompletion(content.asData, nil)
-            case .failure:
-                imageCompletion(nil, NSError())
-            }
-        }
-        capturePictureDataWithCompletion(completion)
-    }
-    
-    /**
-     Captures still image from currently running capture session.
-     
-     :param: imageCompletion Completion block containing the captured imageData
-     */
     open func capturePictureDataWithCompletion(_ imageCompletion: @escaping (CaptureResult) -> Void) {
         guard cameraIsSetup else {
             _show(NSLocalizedString("No capture session setup", comment: ""), message: NSLocalizedString("I can't take any picture", comment: ""))
@@ -701,41 +708,43 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
             return
         }
         
+        captureResultCompletion = imageCompletion
         _updateIlluminationMode(flashMode)
         
         sessionQueue.async { [weak self] in
-            if let self = self {
-                let stillImageOutput = self._getStillImageOutput()
-                if let connection = stillImageOutput.connection(with: AVMediaType.video),
-                   connection.isEnabled {
-                    if self.cameraDevice == CameraDevice.front, connection.isVideoMirroringSupported,
-                       self.shouldFlipFrontCameraImage {
-                        connection.isVideoMirrored = true
-                    }
-                    if connection.isVideoOrientationSupported {
-                        connection.videoOrientation = self._currentCaptureVideoOrientation()
-                    }
-                    
-                    stillImageOutput.captureStillImageAsynchronously(from: connection, completionHandler: { [weak self] sample, error in
-                        
-                        if let error = error {
-                            self?._show(NSLocalizedString("Error", comment: ""), message: error.localizedDescription)
-                            imageCompletion(.failure(error))
-                            return
-                        }
-                        
-                        guard let sample = sample else { imageCompletion(.failure(CaptureError.noSampleBuffer)); return }
-                        if let imageData = AVCaptureStillImageOutput.jpegStillImageNSDataRepresentation(sample) {
-                            imageCompletion(CaptureResult(imageData))
-                        } else {
-                            imageCompletion(.failure(CaptureError.noImageData))
-                        }
-                        
-                    })
-                } else {
-                    imageCompletion(.failure(CaptureError.noVideoConnection))
+            guard let strongSelf = self else { return }
+            
+            let photoOutput = strongSelf._getStillImageOutput()
+            let photoSettings = AVCapturePhotoSettings()
+            
+            // Set flash mode if supported
+            if strongSelf.flashMode == .on && photoOutput.supportedFlashModes.contains(.on) {
+                photoSettings.flashMode = .on
+            } else if strongSelf.flashMode == .off && photoOutput.supportedFlashModes.contains(.off) {
+                photoSettings.flashMode = .off
+            }
+            
+            // Mirror the image for the front camera if needed
+            if strongSelf.cameraDevice == .front {
+                photoSettings.isHighResolutionPhotoEnabled = true
+                if let connection = photoOutput.connection(with: .video),
+                   connection.isVideoMirroringSupported,
+                   strongSelf.shouldFlipFrontCameraImage {
+                    connection.isVideoMirrored = true
                 }
             }
+            
+            // Set the orientation
+            if let connection = photoOutput.connection(with: .video) {
+                if connection.isVideoOrientationSupported {
+                    connection.videoOrientation = strongSelf._currentCaptureVideoOrientation()
+                }
+            } else {
+                strongSelf.imageFinishedProcessing(with: .failure(CaptureError.noVideoConnection))
+            }
+            
+            // Capture photo asynchronously
+            photoOutput.capturePhoto(with: photoSettings, delegate: strongSelf)
         }
     }
     
@@ -1314,20 +1323,22 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
         }
     }
     
-    fileprivate func _getStillImageOutput() -> AVCaptureStillImageOutput {
-        if let stillImageOutput = stillImageOutput, let connection = stillImageOutput.connection(with: AVMediaType.video),
+    fileprivate func _getStillImageOutput() -> AVCapturePhotoOutput {
+        if let photoOutput = photoOutput,
+           let connection = photoOutput.connection(with: AVMediaType.video),
            connection.isActive {
-            return stillImageOutput
+            return photoOutput
         }
-        let newStillImageOutput = AVCaptureStillImageOutput()
-        stillImageOutput = newStillImageOutput
+        
+        let newPhotoOutput = AVCapturePhotoOutput()
+        photoOutput = newPhotoOutput
         if let captureSession = captureSession,
-           captureSession.canAddOutput(newStillImageOutput) {
+           captureSession.canAddOutput(newPhotoOutput) {
             captureSession.beginConfiguration()
-            captureSession.addOutput(newStillImageOutput)
+            captureSession.addOutput(newPhotoOutput)
             captureSession.commitConfiguration()
         }
-        return newStillImageOutput
+        return newPhotoOutput
     }
     
     @objc fileprivate func _orientationChanged() {
@@ -1335,7 +1346,7 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
         
         switch cameraOutputMode {
         case .stillImage:
-            currentConnection = stillImageOutput?.connection(with: AVMediaType.video)
+            currentConnection = photoOutput?.connection(with: AVMediaType.video)
         case .videoOnly, .videoWithMic:
             currentConnection = _getMovieOutput().connection(with: AVMediaType.video)
             if let location = locationManager?.latestLocation {
@@ -1435,7 +1446,7 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
         var orientation: UIInterfaceOrientation?
         
         DispatchQueue.main.async {
-            orientation = UIApplication.shared.statusBarOrientation
+            orientation = UIWindow.interfaceOrientation
         }
         
         /*
@@ -1613,8 +1624,8 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
             // remove current setting
             switch cameraOutputToRemove {
             case .stillImage:
-                if let validStillImageOutput = stillImageOutput {
-                    captureSession?.removeOutput(validStillImageOutput)
+                if let validPhotoOutput = photoOutput {
+                    captureSession?.removeOutput(validPhotoOutput)
                 }
             case .videoOnly, .videoWithMic:
                 if let validMovieOutput = movieOutput {
@@ -1654,8 +1665,8 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
     }
     
     fileprivate func _setupOutputs() {
-        if stillImageOutput == nil {
-            stillImageOutput = AVCaptureStillImageOutput()
+        if photoOutput == nil {
+            photoOutput = AVCapturePhotoOutput()
         }
         if movieOutput == nil {
             movieOutput = _getMovieOutput()
@@ -1887,19 +1898,23 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
     }
     
     fileprivate func _updateFlash(_ flashMode: CameraFlashMode) {
-        captureSession?.beginConfiguration()
-        defer { captureSession?.commitConfiguration() }
-        for captureDevice in AVCaptureDevice.videoDevices {
-            guard let avFlashMode = AVCaptureDevice.FlashMode(rawValue: flashMode.rawValue) else { continue }
-            if captureDevice.isFlashModeSupported(avFlashMode) {
-                do {
-                    try captureDevice.lockForConfiguration()
-                    captureDevice.flashMode = avFlashMode
-                    captureDevice.unlockForConfiguration()
-                } catch {
-                    return
-                }
-            }
+        guard let captureSession = captureSession else { return }
+        
+        captureSession.beginConfiguration()
+        defer { captureSession.commitConfiguration() }
+        
+        // Get AVCapturePhotoOutput
+        guard let photoOutput = captureSession.outputs.compactMap({ $0 as? AVCapturePhotoOutput }).first else { return }
+        
+        // Convert CameraFlashMode to AVCaptureDevice.FlashMode
+        guard let avFlashMode = AVCaptureDevice.FlashMode(rawValue: flashMode.rawValue) else { return }
+        
+        // Check if the desired flash mode is supported by AVCapturePhotoOutput
+        if photoOutput.supportedFlashModes.contains(avFlashMode) {
+            let photoSettings = AVCapturePhotoSettings()
+            photoSettings.flashMode = avFlashMode
+        } else {
+            print("Flash mode not supported.")
         }
     }
     
@@ -1991,7 +2006,11 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
 
 private extension AVCaptureDevice {
     static var videoDevices: [AVCaptureDevice] {
-        return AVCaptureDevice.devices(for: AVMediaType.video)
+        AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.builtInWideAngleCamera],
+            mediaType: .video,
+            position: .unspecified
+        ).devices
     }
 }
 
@@ -2176,5 +2195,28 @@ extension CameraManager: AVCaptureMetadataOutputObjectsDelegate {
         else { return }
         
         handler(.success(stringValue))
+    }
+}
+
+
+extension CameraManager: AVCapturePhotoCaptureDelegate, ImageCompletionDelegate {
+    
+    public func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
+        if let error = error {
+            _show(NSLocalizedString("Error", comment: ""), message: error.localizedDescription)
+            imageFinishedProcessing(with: .failure(error))
+            return
+        }
+        
+        guard let imageData = photo.fileDataRepresentation() else {
+            imageFinishedProcessing(with: .failure(CaptureError.noImageData))
+            return
+        }
+        
+        imageFinishedProcessing(with: CaptureResult(imageData))
+    }
+    
+    public func imageFinishedProcessing(with result: CaptureResult) {
+        captureResultCompletion?(result)
     }
 }
